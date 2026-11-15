@@ -1,0 +1,405 @@
+-- @ScriptType: ModuleScript
+
+---------------------------------------------------
+-- GLOBALS
+
+const ChangeHistoryService = game:GetService("ChangeHistoryService")
+const HttpService = game:GetService("HttpService")
+const Selection = game:GetService("Selection")
+
+const Functions = require(script.Parent:WaitForChild("Functions"))
+
+const Gitsync = require("./Data")
+
+local Interactions = {}
+
+---------------------------------------------------
+-- INITIALIZATION
+local plugin: Plugin
+
+function Interactions.Init(pluginVar)
+	plugin = pluginVar
+end
+
+---------------------------------------------------
+-- FUNCTION DECLARATIONS
+----> Push selected scripts to specified repository & branch
+function Interactions.pushToGitHubSequentially(pushButton, commitmsg)
+	local revisedcommitmsg = (commitmsg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+	local scripts = Functions.getSelectedScripts()
+	local url = "https://api.github.com/repos/" .. plugin:GetSetting(Gitsync.Settings.REPOSITORY) .. "/contents/"
+
+	if next(scripts) == nil then
+		warn("No scripts selected!")
+		task.delay(1, function() pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.White end)
+		pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Red
+		return
+	end
+
+	ChangeHistoryService:SetWaypoint("Before GitHub Push")
+
+	for name, data in pairs(scripts) do
+		local repoInfo = data.Object:GetAttribute("GitSyncRepository")
+
+		if repoInfo and repoInfo:lower() ~= plugin:GetSetting(Gitsync.Settings.REPOSITORY):lower() then
+			warn(`Skipping {data.Object:GetFullName()}: linked to another repository.`)
+			pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Red
+			continue
+		end
+
+		local filePath = data.Object:GetAttribute("GitSyncPath") or Functions.getScriptPath(data.Object)
+		
+		local fileUrl = url .. Functions.encodePath(filePath)
+		local scriptWithMetadata
+		
+		if data["RunContext"] then
+			scriptWithMetadata = "-- @ScriptType: " .. data.Class .. "\n" .. "-- @RunContext: " .. data.RunContext.Value .. "\n" .. data.Source
+		else
+			scriptWithMetadata = "-- @ScriptType: " .. data.Class .. "\n" .. data.Source
+		end
+		
+		local requestBody = {
+			message = revisedcommitmsg ~= "" and revisedcommitmsg or ("Updated " .. filePath),
+			content = Functions.toBase64(scriptWithMetadata),
+			branch = plugin:GetSetting(Gitsync.Settings.BRANCH),
+			sha = Functions.getFileSHA(filePath)
+		}
+
+		local headers = {
+			["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN),
+			["Accept"] = "application/vnd.github.v3+json"
+		}
+
+		local success, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = fileUrl,
+				Method = "PUT",
+				Headers = headers,
+				Body = HttpService:JSONEncode(requestBody)
+			})
+		end)
+
+		if success and response.Success then
+			if plugin:GetSetting(Gitsync.Settings.OUTPUTENABLED) then print("Pushed: ", filePath) end
+			pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Green
+		else
+			warn("Failed to push: ", filePath)
+			warn("Response: ", success and response.Body or tostring(response))
+			pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Red
+		end
+
+		ChangeHistoryService:SetWaypoint("After GitHub Push")
+	end
+end
+
+----> Push selected scripts to specified repository & branch in ONE BATCH COMMIT. :O
+function Interactions.pushToGitHub(pushButton, commitmsg)
+	local success, badnews = pcall(function()
+		local scripts = Functions.getSelectedScripts()
+		local repository = plugin:GetSetting(Gitsync.Settings.REPOSITORY)
+		local branch = plugin:GetSetting(Gitsync.Settings.BRANCH)
+		local baseUrl = "https://api.github.com/repos/" .. repository
+
+		local msg = (commitmsg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		local entries = {}
+		local remotePaths = {}
+
+		for _, data in scripts do
+			local repoInfo = data.Object:GetAttribute("GitSyncRepository")
+
+			if repoInfo and repoInfo:lower() ~= repository:lower() then
+				warn(`Skipping {data.Object:GetFullName()}: linked to another repository.`)
+				continue
+			end
+
+			local path = data.Object:GetAttribute("GitSyncPath")
+				or Functions.getScriptPath(data.Object)
+
+			if remotePaths[path] then
+				warn(`Multiple scripts selected point to same remote path: {path}`)
+			end
+			
+			remotePaths[path] = true
+
+			local source = "-- @ScriptType: " .. data.Class .. "\n"
+
+			if data.RunContext then
+				source ..= "-- @RunContext: " .. data.RunContext.Value .. "\n"
+			end
+
+			source ..= data.Source
+
+			table.insert(entries, {
+				path = path,
+				mode = "100644",
+				type = "blob",
+				content = source, ----> No encoding necessary for blobs
+			})
+		end
+
+		if #entries == 0 then
+			warn("No valid scripts selected!")
+			return
+		end
+		
+		----> Everybody say "Thank you YouTube! Thank you ChatGPT!"
+		----> Sequential pushing has been made obsolete. New tech is in.
+		local function request(method, endpoint, body)
+			local options = {
+				Url = baseUrl .. endpoint,
+				Method = method,
+				Headers = {
+					["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN),
+					["Accept"] = "application/vnd.github+json",
+					["Content-Type"] = "application/json",
+				},
+			}
+
+			if body then
+				options.Body = HttpService:JSONEncode(body)
+			end
+
+			local response = HttpService:RequestAsync(options)
+			assert(response.Success, `GitHub {method} {endpoint} failed ({response.StatusCode}): {response.Body}`)
+
+			return HttpService:JSONDecode(response.Body)
+		end
+		
+		local branches = request("GET", "/branches?per_page=1")
+		
+		----> Gotta do an init push the old fashioned way
+		if #branches == 0 then
+			Interactions.pushToGitHubSequentially(pushButton, commitmsg)
+			return
+		end
+
+		local head = request("GET", "/commits/" .. HttpService:UrlEncode("heads/" .. branch))
+
+		----> Make blobs for files with changes
+		local tree = request("POST", "/git/trees", {
+			base_tree = head.commit.tree.sha,
+			tree = entries,
+		})
+
+		if msg == "" then
+			msg = (#entries == 1) and ("Updated " .. entries[1].path) or (`Updated {#entries} scripts`)
+		end
+
+		----> Make commit
+		local commit = request("POST", "/git/commits", {
+			message = msg,
+			tree = tree.sha,
+			parents = {head.sha},
+		})
+		
+		----> Make branch point to commit
+		request("PATCH", "/git/refs/heads/" .. Functions.encodePath(branch), {
+			sha = commit.sha,
+			force = false,
+		})
+
+		pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Green
+
+		if plugin:GetSetting(Gitsync.Settings.OUTPUTENABLED) then
+			print(`Pushed {#entries} scripts in commit {commit.sha}: {msg}`)
+		end
+	end)
+
+	if not success then
+		warn("Failed to push: ", badnews)
+		pushButton.ImageLabel.ImageColor3 = Gitsync.Colors.Red
+	end
+end
+
+----> Pull folder or entire repository from GitHub and import it to Studio (little button)
+function Interactions.pullFromGitHub(pullButton, path, root)
+
+	ChangeHistoryService:SetWaypoint("Before GitHub Pull")	
+
+	local contents = Functions.getRepoContents(path or "", pullButton)
+	if contents then
+		--local rootFolder = Instance.new("Folder")
+		--local directory = string.split(plugin:GetSetting(Gitsync.Settings.REPOSITORY), "/")
+		--rootFolder.Name = directory[2]
+		--rootFolder.Parent = workspace
+		--print(workspace contents, pullButton)
+		Functions.createStructure(root or workspace, contents, pullButton)
+	else
+		return
+	end
+
+	ChangeHistoryService:SetWaypoint("After GitHub Pull")	
+	return
+end
+
+----> Pull selected scripts from GitHub (big button)
+function Interactions.pullSelectedFromGitHub(pullButton, selected)
+	local scripts = {}
+
+	for _, obj in selected do
+		scripts[obj] = obj:IsA("LuaSourceContainer") or nil
+
+		for _, instance in obj:GetDescendants() do
+			scripts[instance] = instance:IsA("LuaSourceContainer") or nil
+		end
+	end
+
+	if next(scripts) == nil then
+		warn("No scripts selected!")
+		pullButton.ImageLabel.ImageColor3 = Gitsync.Colors.Red
+		return
+	end
+
+	local success = true
+
+	ChangeHistoryService:SetWaypoint("Before GitHub Pull")
+
+	for scriptInstance in pairs(scripts) do
+		local repoInfo = scriptInstance:GetAttribute("GitSyncRepository")
+
+		if repoInfo and not (repoInfo:lower() == plugin:GetSetting(Gitsync.Settings.REPOSITORY):lower()) then
+			warn(`Skipping {scriptInstance:GetFullName()}: linked to another repository`)
+			success = false
+			continue
+		end
+
+		local path = repoInfo and scriptInstance:GetAttribute("GitSyncPath") or Functions.getScriptPath(scriptInstance)
+		local fileData = Functions.getRepoContents(path, pullButton)
+
+		if not (fileData and fileData.type == "file" and fileData.content) then
+			warn(`Pull failed: {path}`)
+			success = false
+			continue
+		end
+		
+		if not Functions.updateScript(scriptInstance, Functions.fromBase64(fileData.content)) then
+			success = false
+		end
+	end
+
+	ChangeHistoryService:SetWaypoint("After GitHub Pull")
+
+	pullButton.ImageLabel.ImageColor3 = if success then Gitsync.Colors.Green else Gitsync.Colors.Red
+end
+
+----> Delete file
+function Interactions.deleteFile(filePath, sha)
+	local HttpService = game:GetService("HttpService")
+	local url = "https://api.github.com/repos/".. plugin:GetSetting(Gitsync.Settings.REPOSITORY).. "/contents/" .. Functions.encodePath(filePath)
+
+	local requestBody = HttpService:JSONEncode({
+		message = "Deleted " .. filePath,
+		sha = sha,
+		branch = plugin:GetSetting(Gitsync.Settings.BRANCH)
+	})
+
+	local headers = {
+		["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN),
+		["Accept"] = "application/vnd.github.v3+json"
+	}
+
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "DELETE",
+			Headers = headers,
+			Body = requestBody
+		})
+	end)
+
+	if success and response.Success then
+		if plugin:GetSetting(Gitsync.Settings.OUTPUTENABLED) then
+			print("Successfully deleted " .. filePath)
+		end
+		return true
+	else
+		warn("Failed to delete file: " .. success and response.Body or tostring(response))
+		return false
+	end
+end
+
+----> Retrieves and returns a list of branches in the repository
+function Interactions.listBranches() : {string}
+	local url = "https://api.github.com/repos/".. plugin:GetSetting(Gitsync.Settings.REPOSITORY) .. "/branches"
+	local headers = { ["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN) }
+
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "GET",
+			Headers = headers
+		})
+	end)
+
+	if success and response.Success then
+		local branches = game:GetService("HttpService"):JSONDecode(response.Body)
+		if plugin:GetSetting(Gitsync.Settings.OUTPUTENABLED) then print("Refreshed branch list: ", branches) end
+		return branches
+	else
+		warn("Failed to list branches: " .. success and response.Body or tostring(response))
+		return {}
+	end
+end
+
+----> Get information (sha) about the latest commit on the specified branch
+function Interactions.getLatestCommitSHA()
+	local HttpService = game:GetService("HttpService")
+	local url = "https://api.github.com/repos/" .. plugin:GetSetting(Gitsync.Settings.REPOSITORY) .. "/branches/" .. plugin:GetSetting(Gitsync.Settings.BRANCH)
+
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "GET",
+			Headers = {
+				["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN),
+				["Accept"] = "application/vnd.github.v3+json"
+			}
+		})
+	end)
+	
+	if not success or not response.Success then
+		warn("Failed to get latest commit SHA: " ..(success and response.Body or tostring(response)))
+		return nil
+	end
+
+	local data = HttpService:JSONDecode(response.Body)
+	return data.commit.sha
+end
+
+----> Create a new branch based on the specified commit
+function Interactions.createBranch(branchName, baseSha)
+	local HttpService = game:GetService("HttpService")
+	local url = "https://api.github.com/repos/".. plugin:GetSetting(Gitsync.Settings.REPOSITORY) .. "/git/refs"
+
+	local requestBody = HttpService:JSONEncode({
+		ref = "refs/heads/" .. branchName,
+		sha = baseSha
+	})
+
+	local headers = {
+		["Authorization"] = "token " .. plugin:GetSetting(Gitsync.Settings.TOKEN),
+		["Accept"] = "application/vnd.github.v3+json"
+	}
+
+	local success, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = requestBody
+		})
+	end)
+
+	if success and response.Success then
+		if plugin:GetSetting(Gitsync.Settings.OUTPUTENABLED) then
+			print("Successfully created branch: " .. branchName)
+		end
+		return true
+	else
+		warn("Failed to create branch: " .. success and response.Body or tostring(response))
+		return nil
+	end
+end
+
+return Interactions
